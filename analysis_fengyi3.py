@@ -7,6 +7,12 @@ from scipy.io import savemat
 from scipy.stats import ttest_rel, ttest_ind
 from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+import multiprocessing
+from functools import partial
+import xlsxwriter
+
 #id filtering
 #analyze with depth information
 #reading data from multiple sample folders
@@ -379,177 +385,368 @@ def load_existing_results(csv_path, classes, dataset_name):
         print(f"!!! 读取现有文件失败: {csv_path}")
         print(f"详细错误: {e}")
         return None, None, None, None
+
+def statistic_diff_means(x, y, axis=0):
+    """置换检验的统计量：均值之差"""
+    return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+def worker_permutation_task(args):
+    """
+    单个任务的工作函数：计算单个脑区、单个指标的 Permutation P-value
+    args: (group1_data_array, group2_data_array, n_resamples)
+    """
+    g1_data, g2_data, n_resamples = args
+    
+    # 简单的方差检查，如果全是0或数据太少，直接返回 1.0
+    if len(g1_data) == 0 or len(g2_data) == 0:
+        return 1.0
+    if np.all(g1_data == 0) and np.all(g2_data == 0):
+        return 1.0
+        
+    # 执行置换检验
+    res = stats.permutation_test(
+        (g1_data, g2_data), 
+        statistic_diff_means, 
+        vectorized=False, 
+        n_resamples=n_resamples, 
+        alternative='two-sided'
+    )
+    return res.pvalue
+
+def perform_advanced_stats(df_template, group_names, classes, group_results,result_dir, n_resamples=1000):
+    """
+    高级统计分析：Permutation Test + FDR Correction
+    输出格式：多 Sheet 的 Excel 文件 (.xlsx)
+    """
+    print(f"--- 启动高级统计分析 (输出为多 Sheet Excel) ---")
+    
+    # --- 1. 数据准备 ---
+    g1_vol = group_results[0][0]
+    g2_vol = group_results[1][0]
+    
+    g1_counts = group_results[0][1] 
+    g2_counts = group_results[1][1]
+    
+    g1_dens = group_results[0][2] 
+    g2_dens = group_results[1][2]
+    
+    g1_label = group_names[0]
+    g2_label = group_names[1]
+
+    # 提取基础信息列 (出现在所有 Sheet 的左侧)
+    # 根据你的截图，这些是关键列
+    target_info_cols = ['id', 'atlas_id', 'parent_structure_id', 'depth', 'name', 'acronym']
+    # 过滤出当前 df_template 中实际存在的列
+    info_cols = [c for c in target_info_cols if c in df_template.columns]
+    df_info = df_template[info_cols].copy()
+    
+    # 初始化显著性计数器
+    sig_counters = np.zeros(len(df_template), dtype=int)
+    
+    # 用于临时存储计算好的 DataFrame，最后再一次性写入 Excel
+    sheets_dict = {} 
+
+    # --- 定义计算函数 (内部复用) ---
+    def calculate_metric_stats(pool, metric_prefix, data1, data2):
+        """计算均值、标准差、Permutation P值、FDR P值"""
+        # 1. 描述性统计
+        m1 = np.mean(data1, axis=1)
+        s1 = np.std(data1, axis=1, ddof=1)
+        m2 = np.mean(data2, axis=1)
+        s2 = np.std(data2, axis=1, ddof=1)
+        
+        # 2. Permutation Test
+        n_regions = data1.shape[0]
+        perm_args = [(data1[r, :], data2[r, :], n_resamples) for r in range(n_regions)]
+        raw_p = pool.map(worker_permutation_task, perm_args) # 调用外部定义的 worker
+        raw_p = np.array(raw_p)
+        
+        # 3. FDR Correction
+        reject, p_fdr, _, _ = multipletests(raw_p, alpha=0.05, method='fdr_bh')
+        
+        # 4. 组装成 DataFrame 部分
+        df_res = pd.DataFrame({
+            f"{metric_prefix} Mean ({g1_label})": m1,
+            f"{metric_prefix} Std ({g1_label})": s1,
+            f"{metric_prefix} Mean ({g2_label})": m2,
+            f"{metric_prefix} Std ({g2_label})": s2,
+            f"{metric_prefix} P-raw": raw_p,
+            f"{metric_prefix} P-FDR": p_fdr
+        })
+        
+        return df_res, p_fdr
+
+    # --- 2. 开始并行计算 ---
+    cpu_count = multiprocessing.cpu_count()
+    with multiprocessing.Pool(processes=cpu_count) as pool:
+        
+        # === A. 处理 Volume ===
+        print("  -> 计算指标: Volume...")
+        df_vol_stats, p_fdr_vol = calculate_metric_stats(pool, "Vol", g1_vol, g2_vol)
+        # 累计显著性
+        sig_counters += (p_fdr_vol < 0.05).astype(int)
+        # 合并信息列和数据列
+        sheets_dict["Volume"] = pd.concat([df_info, df_vol_stats], axis=1)
+
+        # === B. 处理每种细胞 ===
+        for i, class_name in enumerate(classes):
+            print(f"  -> 计算细胞: {class_name}...")
+            
+            # 1. Count
+            df_cnt_stats, p_fdr_cnt = calculate_metric_stats(pool, "Count", g1_counts[i], g2_counts[i])
+            sig_counters += (p_fdr_cnt < 0.05).astype(int)
+            
+            # 2. Density
+            df_den_stats, p_fdr_den = calculate_metric_stats(pool, "Density", g1_dens[i], g2_dens[i])
+            sig_counters += (p_fdr_den < 0.05).astype(int)
+            
+            # 3. 合并该细胞的所有数据到一个 Sheet
+            # 格式: Info + Count Stats + Density Stats
+            df_cell_combined = pd.concat([df_info, df_cnt_stats, df_den_stats], axis=1)
+            
+            # Excel Sheet 名称长度有限制(31字符)，截断一下防止报错
+            sheet_name = class_name[:30] 
+            sheets_dict[sheet_name] = df_cell_combined
+
+    # --- 3. 构建 Summary Sheet (放在最前面) ---
+    df_summary = df_info.copy()
+    df_summary['Total_Significant_Metrics'] = sig_counters
+    # 按显著性降序排列
+    df_summary = df_summary.sort_values(by='Total_Significant_Metrics', ascending=False)
+    
+    # --- 4. 写入 Excel 文件 ---
+    filename_str = f"Stats_Report_{g1_label}_vs_{g2_label}.xlsx"
+    output_path = os.path.join(result_dir, filename_str) # <--- 关键修改
+    print(f"  -> 正在写入 Excel 文件: {output_path} ...")
+    
+    # 使用 xlsxwriter 引擎来支持格式化
+    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+        
+        # 定义一个辅助函数：写入 Sheet 并设置格式
+        def write_sheet_with_format(df, sheet_name):
+            df.to_excel(writer, sheet_name=sheet_name, index=False, freeze_panes=(1, 2)) # 冻结第1行和前2列
+            
+            workbook = writer.book
+            worksheet = writer.sheets[sheet_name]
+            
+            # 设置高亮格式：如果 P-FDR < 0.05，标红
+            red_format = workbook.add_format({'font_color': '#9C0006', 'bg_color': '#FFC7CE'})
+            
+            # 遍历列，找到包含 "P-FDR" 的列，应用条件格式
+            for col_num, col_name in enumerate(df.columns):
+                if "P-FDR" in col_name:
+                    # Excel 列索引从 0 开始 (A=0, B=1...)
+                    # 设置条件格式：Cell Value < 0.05
+                    worksheet.conditional_format(1, col_num, len(df), col_num, # (first_row, first_col, last_row, last_col)
+                                               {'type': 'cell',
+                                                'criteria': '<',
+                                                'value': 0.05,
+                                                'format': red_format})
+            
+            # 自动调整列宽 (简单估算)
+            for i, col in enumerate(df.columns):
+                col_len = len(str(col)) + 2
+                # 限制最大宽度，防止太宽
+                if col_len > 30: col_len = 30
+                if col_len < 10: col_len = 10
+                worksheet.set_column(i, i, col_len)
+
+        # A. 写入 Summary Sheet
+        write_sheet_with_format(df_summary, "Summary")
+        
+        # B. 写入 Volume Sheet
+        # 注意：这里需要按照 Summary 的顺序重新排序 Volume 表，保持一致性？
+        # 或者保持原始顺序。为了查找方便，通常保持原始 ID 顺序，或者也按显著性排序。
+        # 这里我们让其他 Sheet 保持原始 ID 顺序 (df_info 的顺序)，Summary 按显著性排序。
+        write_sheet_with_format(sheets_dict["Volume"], "Volume")
+        
+        # C. 写入各个细胞的 Sheet
+        for class_name in classes:
+            sheet_name = class_name[:30]
+            if sheet_name in sheets_dict:
+                write_sheet_with_format(sheets_dict[sheet_name], sheet_name)
+
+    print(f"完成！请查看生成的文件: {output_path}")
+    return df_summary # 返回 summary 用于可能的打印查看
+
 # ##################################################################
 # %% 第一部分：区域量化 (Regional quantitation)
 # ##################################################################
-print("--- 1. 开始区域量化 ---")
 
-# --- 设置变量 ---
-all_samples_dir = "/data/hdd12tb-1/fengyi/COMBINe/clearmap" #folder containing all Sample subfolders
-template_path = "/home/fyu7/COMBINe/annotations/structure_template.csv" # annotation file, structure_template.csv
-run_group_analysis = True 
-ANALYSIS_DEPTH = 5
-MAX_ID_LIMIT = 5000
-classes = ['red glia','green glia','yellow glia','red neuron','green neuron','yellow neuron']
-header = ['x', 'y', 'z', 'xt', 'yt', 'zt', 'id', 'name', 'sub1', 'sub2', 'sub3']
-save_table = True
-FORCE_RECALCULATE = False
+if __name__ == '__main__':
 
-GROUP_CONFIG = {
-    "Control": "ff",   # 文件夹名包含 'ff' 的归为 Control 组
-    "Experimental": "fw"  # 文件夹名包含 'fw' 的归为 Experimental 组
-}
+    print("--- 1. 开始区域量化 ---")
 
-result_dir = os.path.join(all_samples_dir, 'analysis')
-os.makedirs(result_dir, exist_ok=True)
+    all_samples_dir = "/data/hdd12tb-1/fengyi/COMBINe/clearmap" #folder containing all Sample subfolders
+    template_path = "/home/fyu7/COMBINe/annotations/structure_template.csv" # annotation file, structure_template.csv
+    run_group_analysis = True
+    ANALYSIS_DEPTH = 5
+    MAX_ID_LIMIT = 5000
+    classes = ['red glia','green glia','yellow glia','red neuron','green neuron','yellow neuron']
+    header = ['x', 'y', 'z', 'xt', 'yt', 'zt', 'id', 'name', 'sub1', 'sub2', 'sub3']
+    save_table = True
+    FORCE_RECALCULATE = False
 
-# --- 查找数据集 (即查找所有 Sample 子文件夹) ---
-data_subdirs_paths = []
-if os.path.exists(all_samples_dir):
-    for d in os.listdir(all_samples_dir):
-        full_path = os.path.join(all_samples_dir, d)
-        # 排除 analysis 文件夹，只保留目录
-        if os.path.isdir(full_path) and d != 'analysis' and d != 'analysis_grouped':
-            data_subdirs_paths.append(full_path)
-    data_subdirs_paths.sort() # 排序保证处理顺序一致
-else:
-    print(f"错误: 找不到主目录 {all_samples_dir}")
-    exit()
+    GROUP_CONFIG = {
+        "Control": "ff",   # 文件夹名包含 'ff' 的归为 Control 组
+        "Experimental": "fw"  # 文件夹名包含 'fw' 的归为 Experimental 组
+    }
 
-print(f"在主目录中找到了 {len(data_subdirs_paths)} 个子文件夹。")
+    result_dir = os.path.join(all_samples_dir, 'analysis')
+    os.makedirs(result_dir, exist_ok=True)
 
-# --- 循环处理每个 Sample ---
-volumes = []
-counts = []
-densities = []
-df_results = []
-valid_data_subdirs = [] 
+    # --- 查找数据集 (即查找所有 Sample 子文件夹) ---
+    data_subdirs_paths = []
+    if os.path.exists(all_samples_dir):
+        for d in os.listdir(all_samples_dir):
+            full_path = os.path.join(all_samples_dir, d)
+            # 排除 analysis 文件夹，只保留目录
+            if os.path.isdir(full_path) and d != 'analysis' and d != 'analysis_grouped':
+                data_subdirs_paths.append(full_path)
+        data_subdirs_paths.sort() # 排序保证处理顺序一致
+    else:
+        print(f"错误: 找不到主目录 {all_samples_dir}")
+        exit()
 
-group_indices_map = {name: [] for name in GROUP_CONFIG.keys()}
-dataset_names_list = []
+    print(f"在主目录中找到了 {len(data_subdirs_paths)} 个子文件夹。")
 
-current_data_index = 0 
+    # --- 循环处理每个 Sample ---
+    volumes = []
+    counts = []
+    densities = []
+    df_results = []
+    valid_data_subdirs = [] 
 
-for sample_dir_path in data_subdirs_paths:
-    dataset_name = os.path.basename(os.path.normpath(sample_dir_path))
-    
-    # --- 步骤 A: 判定分组 ---
-    assigned_group = None
-    for group_name, keyword in GROUP_CONFIG.items():
-        if keyword in dataset_name:
-            assigned_group = group_name
-            break 
-    
-    # --- 步骤 B: 检查文件是否存在并决定操作 ---
-    
-    # 构建预期的输出文件名
-    suffix = f"_depth{ANALYSIS_DEPTH}" if ANALYSIS_DEPTH is not None else ""
-    expected_csv_name = f'result_density{suffix}.csv'
-    expected_csv_path = os.path.join(sample_dir_path, expected_csv_name)
-    
-    vol, num, den, df_c = None, None, None, None
-    
-    # 逻辑：如果不强制重算 且 文件存在 -> 加载
-    if not FORCE_RECALCULATE and os.path.exists(expected_csv_path):
-        print(f"[{dataset_name}] 检测到已有结果 ({expected_csv_name}) -> 跳过计算，直接加载...")
-        vol, num, den, df_c = load_existing_results(expected_csv_path, classes, dataset_name)
+    group_indices_map = {name: [] for name in GROUP_CONFIG.keys()}
+    dataset_names_list = []
+
+    current_data_index = 0 
+
+    for sample_dir_path in data_subdirs_paths:
+        dataset_name = os.path.basename(os.path.normpath(sample_dir_path))
         
-        # 如果加载失败（比如文件损坏），则回退到重新计算
-        if vol is None:
-            print(f"[{dataset_name}] 加载失败，尝试重新计算...")
+        # --- 步骤 A: 判定分组 ---
+        assigned_group = None
+        for group_name, keyword in GROUP_CONFIG.items():
+            if keyword in dataset_name:
+                assigned_group = group_name
+                break 
+        
+        # --- 步骤 B: 检查文件是否存在并决定操作 ---
+        # 构建预期的输出文件名
+        suffix = f"_depth{ANALYSIS_DEPTH}" if ANALYSIS_DEPTH is not None else ""
+        expected_csv_name = f'result_density{suffix}.csv'
+        expected_csv_path = os.path.join(sample_dir_path, expected_csv_name)
+        
+        vol, num, den, df_c = None, None, None, None
+        
+        # 逻辑：如果不强制重算 且 文件存在 -> 加载
+        if not FORCE_RECALCULATE and os.path.exists(expected_csv_path):
+            print(f"[{dataset_name}] 检测到已有结果 ({expected_csv_name}) -> 跳过计算，直接加载...")
+            vol, num, den, df_c = load_existing_results(expected_csv_path, classes, dataset_name)
+            # 如果加载失败（比如文件损坏），则回退到重新计算
+            if vol is None:
+                print(f"[{dataset_name}] 加载失败，尝试重新计算...")
+                vol, num, den, df_c = quantify(
+                    sample_dir_path, classes, header, save_table, template_path, 
+                    analysis_depth=ANALYSIS_DEPTH, max_id_limit=MAX_ID_LIMIT
+                )
+                
+        else:
+            # 文件不存在 或 强制重算 -> 执行计算
+            if FORCE_RECALCULATE:
+                print(f"[{dataset_name}] 强制重新计算...")
             vol, num, den, df_c = quantify(
                 sample_dir_path, classes, header, save_table, template_path, 
                 analysis_depth=ANALYSIS_DEPTH, max_id_limit=MAX_ID_LIMIT
             )
+
+        # --- 步骤 C: 收集数据 (无论是计算的还是加载的) ---
+        if vol is not None:
+            volumes.append(vol)
+            counts.append(num)
+            densities.append(den)
+            df_results.append(df_c)
+            dataset_names_list.append(dataset_name)
             
-    else:
-        # 文件不存在 或 强制重算 -> 执行计算
-        if FORCE_RECALCULATE:
-             print(f"[{dataset_name}] 强制重新计算...")
-        vol, num, den, df_c = quantify(
-            sample_dir_path, classes, header, save_table, template_path, 
-            analysis_depth=ANALYSIS_DEPTH, max_id_limit=MAX_ID_LIMIT
-        )
-    
-    # --- 步骤 C: 收集数据 (无论是计算的还是加载的) ---
-    if vol is not None:
-        volumes.append(vol)
-        counts.append(num)
-        densities.append(den)
-        df_results.append(df_c)
-        dataset_names_list.append(dataset_name)
-        
-        if assigned_group:
-            group_indices_map[assigned_group].append(current_data_index)
-        
-        current_data_index += 1
-    else:
-        print(f"警告: 样本 {dataset_name} 处理失败或无法加载。")
+            if assigned_group:
+                group_indices_map[assigned_group].append(current_data_index)
+            
+            current_data_index += 1
+        else:
+            print(f"警告: 样本 {dataset_name} 处理失败或无法加载。")
 
-if not volumes:
-    print("错误：没有有效数据。退出脚本。")
-    exit()
+    if not volumes:
+        print("错误：没有有效数据。退出脚本。")
+        exit()
 
-# --- 4. 保存汇总结果 (results.mat) ---
-# 即使是加载的数据，我们也重新保存一份汇总的 .mat，保证它是最新的
-results_to_save = {
-    'volumes': np.stack(volumes, axis=1), 
-    'counts': np.stack(counts, axis=2),
-    'densities': np.stack(densities, axis=2),
-    'dataset_names': dataset_names_list
-}
-results_mat_path = os.path.join(result_dir, 'results_all.mat')
-savemat(results_mat_path, results_to_save)
-print(f"\n所有数据已汇总并保存到 {results_mat_path}")
+    # --- 4. 保存汇总结果 (results.mat) ---
+    # 即使是加载的数据，我们也重新保存一份汇总的 .mat，保证它是最新的
+    results_to_save = {
+        'volumes': np.stack(volumes, axis=1), 
+        'counts': np.stack(counts, axis=2),
+        'densities': np.stack(densities, axis=2),
+        'dataset_names': dataset_names_list
+    }
+    results_mat_path = os.path.join(result_dir, 'results_all.mat')
+    savemat(results_mat_path, results_to_save)
+    print(f"\n所有数据已汇总并保存到 {results_mat_path}")
 
 # ##################################################################
 # %% 第二部分：分配组并进行统计 (可关闭)
 # ##################################################################
 if run_group_analysis:
-    print("\n--- 2. 开始统计分析 ---")
-    
-    # 筛选有效组
-    active_groups = []
-    active_indices = []
-    
-    for g_name, indices in group_indices_map.items():
-        if indices:
-            active_groups.append(g_name)
-            active_indices.append(indices)
-            print(f"  组 '{g_name}': {len(indices)} 个样本")
-            
-    if len(active_groups) < 2:
-        print("错误: 有效分组不足 2 组，无法统计。")
-    else:
-        # 加载模板 (必须与数据过滤一致)
-        df_template = pd.read_csv(template_path)
-        df_template = df_template[(df_template['id'] >= 0) & (df_template['id'] <= MAX_ID_LIMIT)]
-        if ANALYSIS_DEPTH is not None and 'depth' in df_template.columns:
-             df_template = df_template[df_template['depth'] == ANALYSIS_DEPTH].reset_index(drop=True)
+        print("\n--- 2. 开始统计分析 ---")
+        
+        # 1. 筛选有效组 (保持之前的逻辑)
+        active_group_names = []
+        active_groups_indices = []
+        for g_name, indices in group_indices_map.items():
+            if len(indices) > 0:
+                active_group_names.append(g_name)
+                active_groups_indices.append(indices)
+        
+        if len(active_groups_indices) < 2:
+            print("错误: 有效分组少于 2 组，无法进行统计对比。")
+        else:
+            # 2. 准备数据
+            df_template = pd.read_csv(template_path)
+            # 确保 ID 过滤
+            df_template = df_template[(df_template['id'] >= 0) & (df_template['id'] <= MAX_ID_LIMIT)]
+            if ANALYSIS_DEPTH is not None and 'depth' in df_template.columns:
+                 df_template = df_template[df_template['depth'] == ANALYSIS_DEPTH].reset_index(drop=True)
 
-        # 取前两组对比
-        compare_names = active_groups[:2]
-        compare_indices = active_indices[:2]
-        
-        print(f"正在对比: {compare_names[0]} vs {compare_names[1]}")
-        
-        # 组装数据供 get_df_stats 使用
-        group_results = []
-        for indices in compare_indices:
-            # 这里的 volumes 列表混合了“刚算的”和“读出来的”数据，但格式完全一样
-            g_vol = np.stack([volumes[i] for i in indices], axis=1)
-            g_counts = []
-            g_densities = []
-            for k in range(len(classes)):
-                g_counts.append(np.stack([counts[i][:, k] for i in indices], axis=1))
-                g_densities.append(np.stack([densities[i][:, k] for i in indices], axis=1))
-            group_results.append([g_vol, g_counts, g_densities])
+            group_names_to_compare = active_group_names[:2]
+            groups_indices_to_compare = active_groups_indices[:2]
             
-        # 运行统计
-        df_stats = get_df_stats(df_template, compare_names, classes, group_results)
-        
-        save_name = f"stats_{compare_names[0]}_vs_{compare_names[1]}.csv"
-        df_stats.to_csv(os.path.join(result_dir, save_name), index=False)
-        print(f"统计结果已保存: {save_name}")
+            print(f"正在对比: {group_names_to_compare[0]} vs {group_names_to_compare[1]}")
 
-print("\n--- 全部流程完成 ---")
+            # 3. 提取 Numpy 数组
+            group_results_arrays = []
+            for indices in groups_indices_to_compare:
+                # 提取体积
+                group_vol = np.stack([volumes[i] for i in indices], axis=1)
+                # 提取计数和密度
+                group_counts_by_class = []
+                group_densities_by_class = []
+                for k in range(len(classes)):
+                    c = np.stack([counts[i][:, k] for i in indices], axis=1)
+                    d = np.stack([densities[i][:, k] for i in indices], axis=1)
+                    group_counts_by_class.append(c)
+                    group_densities_by_class.append(d)
+                
+                group_results_arrays.append([group_vol, group_counts_by_class, group_densities_by_class])
+
+            # 4. === 调用新的高级统计函数 ===
+            # n_resamples=1000 是标准配置，如果非常慢可以暂时改为 500
+            _ = perform_advanced_stats(
+                df_template, 
+                group_names_to_compare, 
+                classes, 
+                group_results_arrays, 
+                result_dir=result_dir,  # <--- 传入结果目录
+                n_resamples=1000        # 如果速度太慢，可改为 500
+            )
+
+            # 5. 保存
+            print(f"\n统计分析完成，结果已保存到 {result_dir} 目录下的 Excel 文件中。") 
